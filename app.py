@@ -94,22 +94,25 @@ def get_api_key(sidebar_value: str) -> str:
 # OpenAI 호출 (실패해도 예외를 밖으로 던지지 않음)
 # ----------------------------------------------------------------------------
 def call_llm(api_key: str, model: str, system: str, user: str,
-             max_tokens: int = 900) -> Tuple[Optional[str], Optional[str]]:
+             max_tokens: int = 900) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    OpenAI 1.x SDK 호출. 성공 시 (text, None), 실패 시 (None, error_message).
-    지정 모델이 없으면 후보 모델로 순차 재시도한다.
+    OpenAI 1.x SDK 호출.
+      성공: (text, None, 실제로 응답한 모델명)
+      실패: (None, error_message, None)
+    지정 모델을 쓸 수 없으면 후보 모델로 순차 재시도하므로,
+    화면에는 '요청한 모델'이 아니라 '실제 응답한 모델'을 표기해야 한다.
     """
     if not api_key:
-        return None, "API Key 미입력"
+        return None, "API Key 미입력", None
     try:
         from openai import OpenAI
     except Exception as exc:
-        return None, f"openai 패키지를 불러올 수 없습니다: {exc}"
+        return None, f"openai 패키지를 불러올 수 없습니다: {exc}", None
 
     try:
         client = OpenAI(api_key=api_key)
     except Exception as exc:
-        return None, f"OpenAI 클라이언트 초기화 실패: {exc}"
+        return None, f"OpenAI 클라이언트 초기화 실패: {exc}", None
 
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": user}]
@@ -126,7 +129,8 @@ def call_llm(api_key: str, model: str, system: str, user: str,
                 )
                 text = (resp.choices[0].message.content or "").strip()
                 if text:
-                    return text, None
+                    used = getattr(resp, "model", None) or name
+                    return text, None, used
                 last_error = "빈 응답"
             except Exception as exc:
                 last_error = str(exc)
@@ -135,7 +139,7 @@ def call_llm(api_key: str, model: str, system: str, user: str,
                            for t in ("temperature", "max_tokens", "unsupported",
                                      "unrecognized", "parameter")):
                     break
-    return None, last_error or "알 수 없는 오류"
+    return None, last_error or "알 수 없는 오류", None
 
 
 # ----------------------------------------------------------------------------
@@ -260,7 +264,7 @@ def render_daily_insight(bundle: Dict[str, Any], api_key: str, model: str) -> No
     cache_key = f"{bundle['period_label']}|{bundle['updated_at']:%Y%m%d%H%M}|{model}"
     if st.session_state.get("insight_key") != cache_key:
         with st.spinner("AI가 오늘의 시황을 요약하는 중입니다..."):
-            text, err = call_llm(
+            text, err, used = call_llm(
                 api_key, model, INSIGHT_SYSTEM,
                 "다음 철강 시장 데이터를 바탕으로 오늘의 시황을 3줄 이내로 요약해 주세요.\n\n"
                 + dl.build_llm_context(bundle),
@@ -269,6 +273,7 @@ def render_daily_insight(bundle: Dict[str, Any], api_key: str, model: str) -> No
         st.session_state["insight_key"] = cache_key
         st.session_state["daily_insight"] = text
         st.session_state["insight_error"] = err
+        st.session_state["insight_model"] = used
 
     text = st.session_state.get("daily_insight")
     err = st.session_state.get("insight_error")
@@ -278,7 +283,9 @@ def render_daily_insight(bundle: Dict[str, Any], api_key: str, model: str) -> No
         bullets = [ln.lstrip("-•* ").strip() for ln in lines]
         body = dl.escape_dollars("<br>".join(f"• {b}" for b in bullets if b))
         st.markdown(f"<div class='insight-box'>{body}</div>", unsafe_allow_html=True)
-        st.caption(f"🤖 생성 모델: {model} · {bundle['updated_at']:%Y-%m-%d %H:%M} 기준")
+        used = st.session_state.get("insight_model") or model
+        note = "" if used == model else f" (요청: {model})"
+        st.caption(f"🤖 생성 모델: {used}{note} · {bundle['updated_at']:%Y-%m-%d %H:%M} 기준")
     else:
         st.info(dl.escape_dollars(dl.fallback_daily_insight(bundle)), icon="💡")
         st.caption(f"⚠️ LLM 호출 실패로 샘플 인사이트를 표시합니다. ({err})")
@@ -418,8 +425,8 @@ def render_charts(bundle: Dict[str, Any]) -> None:
         c1.metric(rebar.label, rebar.fmt_value(), rebar.fmt_delta())
         c2.metric(hbeam.label, hbeam.fmt_value(), hbeam.fmt_delta())
         c3.metric("H형강 - 철근 스프레드", f"{spread:,.0f} 원", f"{spread / rebar.last * 100:.1f}%")
-        st.caption("※ 국내 봉형강 유통가는 공개 실시간 API가 없어 시장 실측 기준값에 "
-                   "추이를 매핑한 값입니다. 실제 매매 기준가는 유통 시황지를 확인하세요.")
+
+        render_kr_price_evidence([rebar, hbeam])
 
     with tab3:
         left, right = st.columns([1, 1.25], gap="large")
@@ -452,6 +459,28 @@ def render_charts(bundle: Dict[str, Any]) -> None:
                     st.caption(meta)
 
 
+def render_kr_price_evidence(items) -> None:
+    """국내 유통가의 실시간 추출 근거(기사 문장·출처·링크)를 표시."""
+    st.markdown("##### 🧾 유통시세 산출 근거")
+    for item in items:
+        ev = item.evidence
+        if not ev:
+            st.caption(f"🟡 **{item.label}** — {item.source}. "
+                       "이번 수집에서는 전문지 기사에서 시세 문장을 찾지 못해 "
+                       "기준값으로 표시합니다.")
+            continue
+        when = ev.get("date")
+        stamp = f"{when:%Y-%m-%d}" if when else "날짜 미상"
+        link = ev.get("link") or ""
+        head = f"🟢 **{item.label}** {item.fmt_value()} · {ev['publisher']} {ev['kind']} · {stamp}"
+        st.markdown(f"{head}  ·  [기사 원문]({link})" if link else head)
+        st.caption(f"“{ev['sentence']}”")
+
+    st.caption("※ 국내 봉형강은 공개 가격 API가 없어, 철강 전문지가 보도한 주간 유통시세 "
+               "문장을 파싱해 최신값을 잡습니다. 최신값은 실측이지만 기간 추이 곡선은 "
+               "근사치이며, 실제 매매 기준가는 유통 시황지를 확인하세요.")
+
+
 # ----------------------------------------------------------------------------
 # Section 3 : AI Daily Market Report
 # ----------------------------------------------------------------------------
@@ -480,7 +509,7 @@ def render_report(bundle: Dict[str, Any], api_key: str, model: str) -> None:
     if clicked:
         if api_key:
             with st.spinner("AI가 종합 시황 보고서를 작성하는 중입니다... (약 10~20초)"):
-                text, err = call_llm(
+                text, err, used = call_llm(
                     api_key, model, REPORT_SYSTEM,
                     "다음 철강 시장 데이터를 바탕으로 오늘자 종합 시황 리포트를 작성해 주세요.\n\n"
                     + dl.build_llm_context(bundle),
@@ -489,6 +518,7 @@ def render_report(bundle: Dict[str, Any], api_key: str, model: str) -> None:
             if text:
                 st.session_state["market_report"] = text
                 st.session_state["report_error"] = None
+                st.session_state["report_model"] = used
             else:
                 st.session_state["market_report"] = dl.fallback_report(bundle)
                 st.session_state["report_error"] = err
@@ -503,6 +533,9 @@ def render_report(bundle: Dict[str, Any], api_key: str, model: str) -> None:
             st.warning(f"LLM 리포트를 생성하지 못해 샘플 리포트를 표시합니다. ({err})", icon="⚠️")
         with st.container(border=True):
             st.markdown(dl.escape_dollars(report))
+        used = st.session_state.get("report_model")
+        if used and not err:
+            st.caption(f"🤖 생성 모델: {used} · {bundle['updated_at']:%Y-%m-%d %H:%M} 기준")
         stamp = bundle["updated_at"].strftime("%Y%m%d_%H%M")
         st.download_button(
             "⬇️ 리포트 Markdown 다운로드",

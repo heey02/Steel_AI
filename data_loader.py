@@ -118,6 +118,7 @@ class Indicator:
     series: pd.Series
     source: str = "fallback"
     is_live: bool = False
+    evidence: Optional[Dict[str, Any]] = None   # 실측 근거 (문장/링크/날짜 등)
 
     @property
     def last(self) -> float:
@@ -417,25 +418,227 @@ def fetch_coking_coal(days: int, yf_period: str) -> Indicator:
                      source="대체 데이터 (기준 실측값 $260/t)", is_live=False)
 
 
+# ----------------------------------------------------------------------------
+# 국내 유통가 실시간 수집 (철강 전문지 RSS 요약문 파싱)
+# ----------------------------------------------------------------------------
+# 국내 철근/H형강 유통가는 공개 API가 없고, 전문지의 가격 DB는 유료 회원 전용이다.
+# 다만 아래 매체의 전체기사 RSS 요약문에는 주간 유통시세 문장이 그대로 실린다.
+#   예) "9월 첫째 주 국산 철근 유통시세(SD400, 10mm)는 톤당 84만~85만원으로 ..."
+#       "9월 첫째 주 국산 중소형 H형강 유통시세는 톤당 118만~119만원으로 ..."
+# 이 문장을 파싱해 실제 유통 시세를 추출하고, 근거 문장·출처·날짜를 함께 보관한다.
+KR_PRICE_FEEDS: List[Tuple[str, str]] = [
+    ("철강금속신문", "https://www.snmnews.com/rss/allArticle.xml"),
+    ("스틸데일리", "https://www.steeldaily.co.kr/rss/allArticle.xml"),
+    ("페로타임즈", "https://www.ferrotimes.com/rss/allArticle.xml"),
+]
+
+# 품목 판별 정규식
+KR_PRODUCT_RE = {
+    "rebar_kr": re.compile(r"철근"),
+    "hbeam_kr": re.compile(r"H\s*형강|에이치\s*형강|중소형\s*형강"),
+}
+
+# 가격 종류 우선순위: 유통시세 > 유통가격 > 고시/기준가
+KR_KIND_RULES = [
+    ("유통시세", re.compile(r"유통\s*시세")),
+    ("유통가격", re.compile(r"유통\s*(?:가격|價|향)")),
+    ("고시가격", re.compile(r"고시\s*(?:가격|價)|기준\s*(?:가격|價)")),
+]
+
+# 원/톤 기준 정상 범위
+KR_PRICE_SANITY = {
+    "rebar_kr": (500_000.0, 1_500_000.0),
+    "hbeam_kr": (700_000.0, 1_800_000.0),
+}
+
+_RANGE_RE = re.compile(r"(\d{2,3})\s*만\s*[~∼〜\-–]\s*(\d{2,3})\s*만\s*원")
+_SINGLE_RE = re.compile(r"(\d{2,3})\s*만\s*(?:(\d)\s*천\s*)?원")
+
+
+def _parse_won_per_ton(sentence: str) -> Optional[float]:
+    """
+    한국어 가격 표현을 원/톤 숫자로 변환.
+      "84만~85만원"    -> 845,000 (구간 중간값)
+      "89만원"          -> 890,000
+      "102만 5천원"     -> 1,025,000
+    '80만 원 후반대' 처럼 구체적 수치가 없는 표현은 None 을 반환한다.
+    """
+    s = str(sentence)
+    m = _RANGE_RE.search(s)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        return (lo + hi) / 2 * 10_000
+
+    m = _SINGLE_RE.search(s)
+    if m:
+        # '후반대 / 중반대 / 초반대' 같은 모호 표현 뒤따르면 신뢰하지 않는다
+        tail = s[m.end():m.end() + 12]
+        if re.search(r"(후반|중반|초반|안팎|내외)\s*대?", tail):
+            return None
+        man = int(m.group(1))
+        chun = int(m.group(2)) if m.group(2) else 0
+        return man * 10_000 + chun * 1_000
+    return None
+
+
+def _rss_items(url: str) -> List[Dict[str, str]]:
+    """RSS 를 title/link/pubDate/description 리스트로 파싱 (feedparser 없이 동작)."""
+    if not _HAS_WEB:
+        return []
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT)
+        if resp.status_code != 200:
+            return []
+        resp.encoding = "utf-8"
+        raw = resp.text
+    except Exception:
+        return []
+
+    items: List[Dict[str, str]] = []
+    for block in re.findall(r"<item[^>]*>(.*?)</item>", raw, re.S | re.I):
+        def _tag(name: str) -> str:
+            m = re.search(rf"<{name}[^>]*>(.*?)</{name}>", block, re.S | re.I)
+            if not m:
+                return ""
+            val = re.sub(r"<!\[CDATA\[|\]\]>", "", m.group(1))
+            val = re.sub(r"<[^>]+>", " ", val)
+            return re.sub(r"\s+", " ", val).strip()
+
+        items.append({
+            "title": _tag("title"),
+            "link": _tag("link"),
+            "published": _tag("pubDate"),
+            "summary": _tag("description"),
+        })
+    return items
+
+
+def _parse_rss_date(text: str) -> Optional[dt.datetime]:
+    """RFC822 및 국내 언론사 CMS 형식('2026-09-01 15:07:48') 모두 지원."""
+    raw = str(text).strip()
+    if not raw:
+        return None
+    try:
+        from email.utils import parsedate_to_datetime
+        return parsedate_to_datetime(raw).replace(tzinfo=None)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+                "%Y.%m.%d %H:%M:%S", "%Y.%m.%d"):
+        try:
+            return dt.datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _split_sentences(text: str) -> List[str]:
+    """한국어 기사 요약을 문장 단위로 분리."""
+    # 국내 기사 요약은 '...출발했다.앞서' 처럼 마침표 뒤 공백이 없는 경우가 많다
+    parts = re.split(r"(?<=다\.)\s*|(?<=\.)\s+|\n+", str(text))
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def fetch_kr_distribution_prices(max_age_days: int = 21) -> Dict[str, Dict[str, Any]]:
+    """
+    철강 전문지 RSS 요약문에서 국내 철근/H형강 유통 시세를 추출한다.
+
+    Returns:
+        {"rebar_kr": {"value": 845000.0, "kind": "유통시세",
+                      "sentence": "...", "link": "...", "publisher": "철강금속신문",
+                      "date": datetime}, ...}
+        추출 실패한 품목은 결과에 포함되지 않는다.
+    """
+    found: Dict[str, Dict[str, Any]] = {}
+    if not _HAS_WEB:
+        return found
+
+    cutoff = dt.datetime.now() - dt.timedelta(days=max_age_days)
+
+    for publisher, url in KR_PRICE_FEEDS:
+        for item in _rss_items(url):
+            when = _parse_rss_date(item.get("published", ""))
+            if when and when < cutoff:
+                continue
+            body = f"{item.get('title', '')}. {item.get('summary', '')}"
+            for sentence in _split_sentences(body):
+                if "톤당" not in sentence and "t당" not in sentence.lower():
+                    continue
+                for key, product_re in KR_PRODUCT_RE.items():
+                    if not product_re.search(sentence):
+                        continue
+                    # 철근 정규식이 'H형강' 문장에 걸리는 경우 방지
+                    if key == "rebar_kr" and KR_PRODUCT_RE["hbeam_kr"].search(sentence):
+                        continue
+                    kind = next((name for name, rx in KR_KIND_RULES
+                                 if rx.search(sentence)), None)
+                    if kind is None:
+                        continue
+                    value = _parse_won_per_ton(sentence)
+                    if value is None:
+                        continue
+                    lo, hi = KR_PRICE_SANITY[key]
+                    if not (lo <= value <= hi):
+                        continue
+
+                    rank = [n for n, _ in KR_KIND_RULES].index(kind)
+                    prev = found.get(key)
+                    prev_rank = ([n for n, _ in KR_KIND_RULES].index(prev["kind"])
+                                 if prev else 99)
+                    prev_date = prev["date"] if prev and prev.get("date") else None
+                    # 종류 우선순위(유통시세 우선) -> 최신 날짜 순으로 채택
+                    better = (rank < prev_rank) or (
+                        rank == prev_rank and when and (not prev_date or when > prev_date)
+                    )
+                    if prev is None or better:
+                        found[key] = {
+                            "value": float(value),
+                            "kind": kind,
+                            "sentence": sentence[:220],
+                            "link": item.get("link", ""),
+                            "publisher": publisher,
+                            "date": when,
+                        }
+    return found
+
+
 def fetch_steel_products(days: int) -> Dict[str, Indicator]:
     """
     국내외 제품 유통가.
-      - 국내 철근/H형강 : 공개 실시간 API 부재 -> 유통가 실측 기준값 매핑 + 추이 근사
+      - 국내 철근/H형강 : 철강 전문지 RSS 요약문에서 주간 유통시세 실시간 추출
+                          (실패 시 실측 기준값 매핑으로 자동 전환)
       - 미국 열연(HRC)  : Trading Economics 'hrc-steel'
       - 중국 철강       : Trading Economics 'steel'
     """
     out: Dict[str, Indicator] = {}
 
-    out["rebar_kr"] = Indicator(
-        "rebar_kr", "국내 철근 유통가", "원/톤",
-        _synthetic_series("rebar_kr", days),
-        source="국내 유통가 실측 기준값 매핑 (약 86만원/톤)", is_live=False,
-    )
-    out["hbeam_kr"] = Indicator(
-        "hbeam_kr", "국내 H형강 유통가", "원/톤",
-        _synthetic_series("hbeam_kr", days),
-        source="국내 유통가 실측 기준값 매핑 (약 120만원/톤)", is_live=False,
-    )
+    try:
+        kr = fetch_kr_distribution_prices()
+    except Exception:
+        kr = {}
+
+    kr_meta = {
+        "rebar_kr": ("국내 철근 유통가", "약 86만원/톤"),
+        "hbeam_kr": ("국내 H형강 유통가", "약 120만원/톤"),
+    }
+    for key, (label, ref) in kr_meta.items():
+        quote = kr.get(key)
+        if quote:
+            when = quote.get("date")
+            stamp = f", {when:%m/%d}" if when else ""
+            out[key] = Indicator(
+                key, label, "원/톤",
+                _series_from_spot(key, quote["value"], days),
+                source=f"{quote['publisher']} {quote['kind']}{stamp}",
+                is_live=True,
+                evidence=quote,
+            )
+        else:
+            out[key] = Indicator(
+                key, label, "원/톤",
+                _synthetic_series(key, days),
+                source=f"실측 기준값 매핑 ({ref})", is_live=False,
+            )
 
     us = _sane("hrc_us", _te_price_usd("hrc-steel", "hrc steel"))
     out["hrc_us"] = Indicator(
