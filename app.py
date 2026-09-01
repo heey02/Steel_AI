@@ -65,6 +65,23 @@ CUSTOM_CSS = """
         border-left: 5px solid #E8743B; border-radius: 8px;
         background: rgba(232,116,59,0.07); padding: 16px 20px; line-height:1.75;
     }
+
+    /* 좁은 화면 대응 --------------------------------------------------------
+       Streamlit 컬럼은 flex:1 1 calc(20% - 16px) / min-width:auto 라서
+       5개 지표 카드가 한 줄에 강제로 눌려 들어가고, 값 폰트가 36px 고정이라
+       "1,371.8원"이 "1…" 로 잘린다. 최소 너비를 줘서 줄바꿈되게 하고
+       값 폰트를 화면 폭에 따라 줄인다. */
+    div[data-testid="stHorizontalBlock"] { flex-wrap: wrap; }
+    div[data-testid="stColumn"] { min-width: 172px; }
+    div[data-testid="stMetricValue"] {
+        font-size: clamp(1.35rem, 2.1vw, 2.1rem);
+        line-height: 1.25;
+    }
+    div[data-testid="stMetricLabel"] p,
+    div[data-testid="stMetricLabel"] div {
+        white-space: normal; overflow: visible; text-overflow: clip;
+    }
+    div[data-testid="stMetricDelta"] { font-size: 0.85rem; }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
